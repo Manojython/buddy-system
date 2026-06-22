@@ -1,0 +1,23 @@
+# Local inference (Apple Silicon)
+mlx-lm>=0.18.0
+
+# Cloud buddy
+anthropic>=0.40.0
+python-dotenv>=1.0.0
+
+# Classical NLP tools
+spacy>=3.7.0
+gensim>=4.3.0
+scikit-learn>=1.4.0
+rapidfuzz>=3.6.0
+vaderSentiment>=3.3.2
+sentence-transformers>=2.6.0
+
+# Eval datasets (HuggingFace)
+datasets>=2.18.0
+
+# Rust bridge build tool
+maturin>=1.7.0
+
+# Dev / test
+pytest>=8.0.0

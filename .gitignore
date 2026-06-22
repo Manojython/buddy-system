@@ -1,0 +1,70 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.env
+
+# Rust / maturin compiled output
+target/
+*.so
+*.pyd
+
+# Model weights and caches
+*.bin
+*.safetensors
+*.gguf
+*.pt
+*.pth
+*.npz
+models/
+.cache/
+~/.cache/huggingface/
+
+# Environment / secrets
+.env
+*.env
+.envrc
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs and eval output
+logs/
+*.log
+
+# Scratch / temp work
+scratch/
+
+# HuggingFace model cache (can be huge)
+scratch/gemma_check/
+
+# Compiled Rust extension
+frugal/_bridge*.so
+frugal/_bridge*.pyd
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Cargo lock for library crates (keep for binaries)
+# Cargo.lock  ← keep this, helps reproducibility
+
+# misc
+docs/
+.claude/
