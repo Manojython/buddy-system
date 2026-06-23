@@ -6,7 +6,7 @@ number that makes the classical-tool tier's case in the article.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import re
 
 
@@ -29,6 +29,7 @@ class ConditionResult:
     total_output_tokens: int
     latency_ms: float
     cost_usd: float = 0.0  # set explicitly; accounts for multi-model conditions
+    per_dataset: dict[str, tuple[int, int]] = field(default_factory=dict)  # dataset → (correct, total)
 
     @property
     def accuracy(self) -> float:
@@ -99,6 +100,40 @@ def _arc_answer(text: str) -> str:
     return standalone[-1].group(1).upper() if standalone else ""
 
 
+def _squad_normalize(text: str) -> list[str]:
+    """Standard SQuAD normalization: lowercase, strip articles + punctuation."""
+    text = text.lower()
+    text = re.sub(r"\b(a|an|the)\b", " ", text)
+    text = re.sub(r"[^a-z0-9 ]", " ", text)
+    return [t for t in text.split() if t]
+
+
+def _squad_f1(prediction: str, ground_truth: str) -> float:
+    pred_tokens = _squad_normalize(prediction)
+    truth_tokens = _squad_normalize(ground_truth)
+    if not pred_tokens or not truth_tokens:
+        return 1.0 if pred_tokens == truth_tokens else 0.0
+    common = set(pred_tokens) & set(truth_tokens)
+    if not common:
+        return 0.0
+    precision = len(common) / len(pred_tokens)
+    recall = len(common) / len(truth_tokens)
+    return 2 * precision * recall / (precision + recall)
+
+
+def _squad_answer(text: str) -> str:
+    """Extract the answer phrase from Gemma's output.
+
+    Uses the LAST "Answer:" line so Sonnet's synthesis (appended after Gemma's
+    raw chain) takes precedence over any wrong "Answer:" Gemma wrote mid-chain.
+    """
+    matches = list(re.finditer(r"(?i)\bAnswer:\s*(.+)", text))
+    if matches:
+        return matches[-1].group(1).strip().split("\n")[0].strip()
+    lines = [l.strip() for l in text.strip().split("\n") if l.strip()]
+    return lines[-1] if lines else text.strip()
+
+
 def _gsm8k_answer(text: str) -> str:
     matches = list(re.finditer(r"(?i)answer\s*:\s*(-?[\d,]+(?:\.\d+)?)", text))
     if matches:
@@ -161,7 +196,7 @@ def evaluate_output(sample: object, output: str) -> EvalScore:
         pred = _last_label(output, labels)
         return EvalScore(correct=pred == expected, prediction=pred, score=1.0 if pred == expected else 0.0)
 
-    if dataset == "arc_challenge":
+    if dataset in ("arc_challenge", "mmlu"):
         pred = _arc_answer(output)
         return EvalScore(correct=pred == expected, prediction=pred, score=1.0 if pred == expected else 0.0)
 
@@ -172,6 +207,11 @@ def evaluate_output(sample: object, output: str) -> EvalScore:
 
     if dataset == "wikiann":
         return _extraction_score(expected, output)
+
+    if dataset in ("squad", "hotpotqa"):
+        pred = _squad_answer(output)
+        f1 = _squad_f1(pred, expected)
+        return EvalScore(correct=f1 >= 0.5, prediction=pred, score=f1)
 
     pred = _clean(output)
     truth = _clean(expected)
@@ -186,12 +226,46 @@ def max_tokens_for(sample: object) -> int:
         return 96
     if dataset == "gsm8k":
         return 512
+    if dataset == "mmlu":
+        return 512
+    if dataset in ("squad", "hotpotqa"):
+        return 512
     return 128
 
 
 def token_cost(model: str, input_tokens: int, output_tokens: int) -> float:
     p = PRICING.get(model, PRICING["claude-sonnet-4-6"])
     return input_tokens * p["input"] / 1_000_000 + output_tokens * p["output"] / 1_000_000
+
+
+def compare_datasets(results: list[ConditionResult]) -> None:
+    """Print per-dataset accuracy breakdown for each condition."""
+    if not results:
+        return
+
+    all_datasets = sorted(
+        {ds for r in results for ds in r.per_dataset}
+    )
+    if not all_datasets:
+        return
+
+    conditions = [r.condition.split("(")[0].strip() for r in results]
+    col0_w = max(len(ds) for ds in all_datasets) + 2
+    col_w = max(max(len(c) for c in conditions) + 2, 10)
+
+    header_parts = [f"{'Dataset':<{col0_w}}"] + [f"{c:<{col_w}}" for c in conditions]
+    print(" | ".join(header_parts))
+    print("-+-".join(["-" * col0_w] + ["-" * col_w for _ in conditions]))
+
+    for ds in all_datasets:
+        row = [f"{ds:<{col0_w}}"]
+        for r in results:
+            if ds in r.per_dataset:
+                c, t = r.per_dataset[ds]
+                row.append(f"{c}/{t} ({c/t:.0%})" if t else f"0/0 (n/a)")
+            else:
+                row.append(f"{'—':<{col_w}}")
+        print(" | ".join(f"{cell:<{col_w}}" if i > 0 else cell for i, cell in enumerate(row)))
 
 
 def compare(results: list[ConditionResult]) -> None:

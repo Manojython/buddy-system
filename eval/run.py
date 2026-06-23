@@ -28,7 +28,7 @@ from frugal.tools.registry import ToolRegistry
 from frugal.tools import classifier, ner, similarity, sentiment, math_solver
 
 from eval.datasets import load_all, EvalSample
-from eval.metrics import ConditionResult, evaluate_output, max_tokens_for, token_cost, compare
+from eval.metrics import ConditionResult, evaluate_output, max_tokens_for, token_cost, compare, compare_datasets
 
 
 _log_file: "TextIO | None" = None
@@ -57,6 +57,7 @@ def _build_registry() -> ToolRegistry:
 def _run_local(local: LocalModel, samples: list[EvalSample], verbose: bool = False) -> ConditionResult:
     """Local 4B model only — zero cloud cost, baseline accuracy floor."""
     correct = 0
+    per_dataset: dict[str, list[int]] = {}
     t0 = time.perf_counter()
 
     for i, s in enumerate(samples):
@@ -72,6 +73,12 @@ def _run_local(local: LocalModel, samples: list[EvalSample], verbose: bool = Fal
         score = evaluate_output(s, output)
         if score.correct:
             correct += 1
+        ds = s.dataset
+        if ds not in per_dataset:
+            per_dataset[ds] = [0, 0]
+        per_dataset[ds][1] += 1
+        if score.correct:
+            per_dataset[ds][0] += 1
         sample_ms = (time.perf_counter() - t_sample) * 1000
         if verbose:
             _log(f"  ── local [{i+1}/{len(samples)}] ──────────────────────────")
@@ -91,6 +98,7 @@ def _run_local(local: LocalModel, samples: list[EvalSample], verbose: bool = Fal
         cloud_calls=0, classical_calls=0,
         total_input_tokens=0, total_output_tokens=0,
         latency_ms=elapsed_ms, cost_usd=0.0,
+        per_dataset={ds: (v[0], v[1]) for ds, v in per_dataset.items()},
     )
 
 
@@ -106,6 +114,7 @@ def _run_anthropic_advisor(
     correct = 0
     cost = 0.0
     total_in = total_out = 0
+    per_dataset: dict[str, list[int]] = {}
     t0 = time.perf_counter()
 
     for i, s in enumerate(samples):
@@ -128,6 +137,12 @@ def _run_anthropic_advisor(
         score = evaluate_output(s, opus_result["patch"])
         if score.correct:
             correct += 1
+        ds = s.dataset
+        if ds not in per_dataset:
+            per_dataset[ds] = [0, 0]
+        per_dataset[ds][1] += 1
+        if score.correct:
+            per_dataset[ds][0] += 1
         total_in += haiku_result["input_tokens"] + opus_result["input_tokens"]
         total_out += haiku_result["output_tokens"] + opus_result["output_tokens"]
         sample_ms = (time.perf_counter() - t_sample) * 1000
@@ -157,6 +172,7 @@ def _run_anthropic_advisor(
         classical_calls=0,
         total_input_tokens=total_in, total_output_tokens=total_out,
         latency_ms=elapsed_ms, cost_usd=cost,
+        per_dataset={ds: (v[0], v[1]) for ds, v in per_dataset.items()},
     )
 
 
@@ -176,6 +192,7 @@ def _run_buddy(
 
     correct = cloud = classical_c = in_tok = out_tok = 0
     cost = 0.0
+    per_dataset: dict[str, list[int]] = {}
     t0 = time.perf_counter()
 
     for i, s in enumerate(samples):
@@ -184,10 +201,17 @@ def _run_buddy(
             s.prompt,
             node_type_hint=s.node_type,
             max_tokens=max_tokens_for(s),
+            document=s.document,
         )
         score = evaluate_output(s, result.output)
         if score.correct:
             correct += 1
+        ds = s.dataset
+        if ds not in per_dataset:
+            per_dataset[ds] = [0, 0]
+        per_dataset[ds][1] += 1
+        if score.correct:
+            per_dataset[ds][0] += 1
         cloud += result.cloud_calls
         classical_c += result.classical_calls
         in_tok += result.total_input_tokens
@@ -220,6 +244,7 @@ def _run_buddy(
         cloud_calls=cloud, classical_calls=classical_c,
         total_input_tokens=in_tok, total_output_tokens=out_tok,
         latency_ms=elapsed_ms, cost_usd=cost,
+        per_dataset={ds: (v[0], v[1]) for ds, v in per_dataset.items()},
     )
 
 
@@ -239,6 +264,8 @@ def main() -> None:
     )
     parser.add_argument("--verbose", action="store_true",
                         help="Print per-sample logs: output, verdict, tokens, cost, latency")
+    parser.add_argument("--dataset", default=None,
+                        help="Only run samples from this dataset (e.g. mmlu, gsm8k). Default: all.")
     args = parser.parse_args()
 
     # Set up log file: logs/<mode>_n<n>_<timestamp>.log
@@ -246,15 +273,19 @@ def main() -> None:
     log_dir = Path("logs")
     log_dir.mkdir(exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_path = log_dir / f"{args.mode}_n{args.n}_{ts}.log"
+    ds_tag = f"_{args.dataset}" if args.dataset else ""
+    log_path = log_dir / f"{args.mode}_n{args.n}{ds_tag}_{ts}.log"
     _log_file = open(log_path, "w", buffering=1)  # line-buffered
     _log(f"Run started: {datetime.now().isoformat()}  mode={args.mode}  n={args.n}  "
          f"local_model={args.local_model}  buddy_model={args.buddy_model}  verbose={args.verbose}")
     _log(f"Log file: {log_path.resolve()}\n")
 
-    total = args.n * 6
-    _log(f"Loading datasets ({args.n} × 6 = {total} samples)...")
+    total = args.n * 7
+    _log(f"Loading datasets ({args.n} × 7 = {total} samples)...")
     samples = load_all(args.n)
+    if args.dataset:
+        samples = [s for s in samples if s.dataset == args.dataset]
+        _log(f"Filtered to dataset={args.dataset!r}: {len(samples)} samples.")
     _log(f"Loaded {len(samples)} samples.\n")
 
     results: list[ConditionResult] = []
@@ -298,6 +329,8 @@ def main() -> None:
     old_stdout = sys.stdout
     sys.stdout = buf
     compare(results)
+    print()
+    compare_datasets(results)
     sys.stdout = old_stdout
     table_str = buf.getvalue()
     _log(table_str)

@@ -68,3 +68,4 @@ frugal/_bridge*.pyd
 # misc
 docs/
 .claude/
+publications/

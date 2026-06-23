@@ -91,8 +91,17 @@ class Pipeline:
         node_type_hint: str = "claim",
         max_tokens: int = 512,
         temp: float = 0.0,
+        document: str = "",
     ) -> PipelineResult:
+        from frugal.uncertainty import extract_uncertain_span
+        from frugal.retriever import retrieve_relevant_chunk
+
         formatted = self.local_model.format_prompt(prompt)
+
+        # Document QA mode: collect uncertain spans during generation,
+        # then fire all Sonnet queries concurrently (async batch) after generation.
+        is_doc_qa = bool(document) and node_type_hint == "document_qa"
+        pending_queries: list = []  # list of (UncertainSpan, doc_chunk)
 
         output_parts: list[str] = []
         current_tokens: list[str] = []
@@ -124,7 +133,6 @@ class Pipeline:
             if is_boundary and current_tokens:
                 node_text = accumulated.strip()
                 avg_entropy = sum(current_entropies) / len(current_entropies)
-                # Convert average entropy to a confidence proxy in [0, 1]
                 avg_confidence = 1.0 / (1.0 + avg_entropy)
 
                 if self._graph:
@@ -135,23 +143,33 @@ class Pipeline:
                     node_id = f"n{len(output_parts)}"
 
                 if should_interrupt:
-                    node = {
-                        "id": node_id,
-                        "type": node_type_hint,
-                        "text": node_text,
-                        "confidence": avg_confidence,
-                    }
-                    esc = self._escalate(node)
-                    escalations.append(esc)
-
-                    if esc.routed_to == "classical":
-                        classical_calls += 1
+                    if is_doc_qa:
+                        # Don't block generation — extract the uncertain span and
+                        # queue it. Sonnet fires concurrently after generation ends.
+                        span = extract_uncertain_span(node_text, current_entropies)
+                        if span:
+                            query = prompt.split("Question:")[-1].strip() if "Question:" in prompt else prompt
+                            doc_chunk = retrieve_relevant_chunk(document, f"{span.text} {query}")
+                            pending_queries.append((span, doc_chunk))
+                        output_parts.append(node_text)  # keep raw Gemma output for now
                     else:
-                        cloud_calls += 1
-                        total_input += esc.input_tokens
-                        total_output += esc.output_tokens
+                        node = {
+                            "id": node_id,
+                            "type": node_type_hint,
+                            "text": node_text,
+                            "confidence": avg_confidence,
+                        }
+                        esc = self._escalate(node)
+                        escalations.append(esc)
 
-                    output_parts.append(esc.result_text)
+                        if esc.routed_to == "classical":
+                            classical_calls += 1
+                        else:
+                            cloud_calls += 1
+                            total_input += esc.input_tokens
+                            total_output += esc.output_tokens
+
+                        output_parts.append(esc.result_text)
                 else:
                     output_parts.append(node_text)
 
@@ -159,25 +177,63 @@ class Pipeline:
                 current_tokens = []
                 current_entropies = []
 
-        # Flush any trailing tokens that didn't end on a boundary
         if current_tokens:
             output_parts.append("".join(current_tokens))
 
-        # For reasoning tasks with cloud escalations: Gemma's KV cache can't see
-        # Sonnet's clause corrections, so its final Answer: line may be wrong.
-        # One synthesis call reads the corrected chain and extracts the right answer.
-        if node_type_hint == "reasoning" and cloud_calls > 0:
+        if is_doc_qa and pending_queries:
+            # Async phase: all Sonnet calls fire in parallel, generation already done.
+            original_question = prompt.split("Question:")[-1].strip() if "Question:" in prompt else prompt
+            corrections = self.buddy.ask_targeted_batch(pending_queries, original_question)
+            cloud_calls += len(corrections)
+            total_input += sum(c["input_tokens"] for c in corrections)
+            total_output += sum(c["output_tokens"] for c in corrections)
+
+            # Apply corrections: replace each uncertain span with Sonnet's answer
+            raw_output = " ".join(output_parts)
+            for (span, _), correction in zip(pending_queries, corrections):
+                if correction["verdict"] == "corrected" and correction["patch"]:
+                    raw_output = raw_output.replace(span.text, correction["patch"], 1)
+                escalations.append(Escalation(
+                    node_id="targeted",
+                    node_type=node_type_hint,
+                    original_text=span.text,
+                    routed_to="cloud",
+                    tool_name="ask_targeted",
+                    result_text=correction["patch"],
+                    confidence=0.95,
+                    input_tokens=correction["input_tokens"],
+                    output_tokens=correction["output_tokens"],
+                ))
+
+            # Synthesis: passage + question only. The corrected chain has already
+            # flagged and verified uncertain spans — but Gemma's overall conclusion
+            # may still be wrong. Sonnet answers from the passage directly,
+            # treating the chain as advisory context only.
+            synthesis = self.buddy.final_answer(
+                "",  # don't let Gemma's wrong conclusion anchor Sonnet
+                document=document,
+                question=original_question,
+            )
+            final_output = raw_output + "\n" + synthesis["text"]
+            cloud_calls += 1
+            total_input += synthesis["input_tokens"]
+            total_output += synthesis["output_tokens"]
+
+        elif node_type_hint == "reasoning" and cloud_calls > 0:
             corrected_chain = " ".join(output_parts)
             synthesis = self.buddy.final_answer(corrected_chain)
             output_parts.append("\n" + synthesis["text"])
             cloud_calls += 1
             total_input += synthesis["input_tokens"]
             total_output += synthesis["output_tokens"]
+            final_output = " ".join(output_parts)
+        else:
+            final_output = " ".join(output_parts)
 
         graph_nodes = self._graph.all_nodes() if self._graph else []
 
         return PipelineResult(
-            output=" ".join(output_parts),
+            output=final_output,
             graph_nodes=graph_nodes,
             cloud_calls=cloud_calls,
             classical_calls=classical_calls,

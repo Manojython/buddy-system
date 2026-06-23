@@ -20,6 +20,7 @@ class EvalSample:
     ground_truth: str
     node_type: str  # maps directly to router registry keys
     dataset: str
+    document: str = ""  # source document for document_qa tasks
 
 
 def load_ag_news(n: int = 200) -> list[EvalSample]:
@@ -131,33 +132,85 @@ def load_gsm8k(n: int = 20) -> list[EvalSample]:
     return samples[:n]
 
 
-def load_arc_challenge(n: int = 20) -> list[EvalSample]:
-    """ARC hard science MCQ — requires reasoning beyond pattern matching."""
+
+def load_squad(n: int = 20) -> list[EvalSample]:
+    """SQuAD v2 reading comprehension — questions grounded in a passage.
+
+    Perfect for the targeted buddy flow: Gemma reads a passage and answers a
+    question. When entropy spikes on a name/date/fact, the uncertain span is
+    sent to Sonnet with the relevant passage chunk — not the full reasoning chain.
+    Sonnet fact-checks the specific span against the source text.
+    """
     from datasets import load_dataset
 
-    ds = load_dataset("allenai/ai2_arc", "ARC-Challenge", split=f"test[:{n}]")
+    ds = load_dataset("rajpurkar/squad_v2", split=f"validation[:{n * 3}]")
     samples = []
     for row in ds:
-        choices_text = "\n".join(
-            f"  {label}. {text}"
-            for label, text in zip(row["choices"]["label"], row["choices"]["text"])
-        )
+        if not row["answers"]["text"]:
+            continue  # skip unanswerable questions
+        ground_truth = row["answers"]["text"][0]
+        context = row["context"]
+        question = row["question"]
         samples.append(EvalSample(
             prompt=(
-                "Answer the following multiple-choice science question.\n"
-                "Return only the letter of the correct answer.\n\n"
-                f"Question: {row['question']}\n{choices_text}"
+                f"Read the following passage carefully, then think through the question "
+                f"step by step before answering. On the last line write: Answer: <answer>\n\n"
+                f"Passage: {context}\n\n"
+                f"Question: {question}"
             ),
-            ground_truth=row["answerKey"],
-            node_type="reasoning",
-            dataset="arc_challenge",
+            ground_truth=ground_truth,
+            node_type="document_qa",
+            dataset="squad",
+            document=context,
         ))
+        if len(samples) >= n:
+            break
+    return samples[:n]
+
+
+def load_hotpotqa(n: int = 20) -> list[EvalSample]:
+    """HotpotQA — multi-hop Wikipedia QA requiring 2-step reasoning.
+
+    Distractor config gives 10 paragraphs (2 supporting + 8 distractors), making
+    the retriever's job meaningful: find the right chunk for the uncertain span.
+    Bridge questions require connecting two facts; comparison questions are yes/no.
+    Both types trigger real entropy spikes at the pivot entity or comparison value.
+    """
+    from datasets import load_dataset
+
+    ds = load_dataset("hotpotqa/hotpot_qa", "distractor", split=f"validation[:{n * 3}]")
+    samples = []
+    for row in ds:
+        titles = row["context"]["title"]
+        sentences = row["context"]["sentences"]
+
+        paragraphs = [
+            f"[{title}]\n" + " ".join(sents)
+            for title, sents in zip(titles, sentences)
+        ]
+        document = "\n\n".join(paragraphs)
+
+        samples.append(EvalSample(
+            prompt=(
+                "Read the following passages carefully, then think through the "
+                "multi-hop question step by step before answering. "
+                "On the last line write: Answer: <answer>\n\n"
+                f"Passages:\n{document}\n\n"
+                f"Question: {row['question']}"
+            ),
+            ground_truth=row["answer"],
+            node_type="document_qa",
+            dataset="hotpotqa",
+            document=document,
+        ))
+        if len(samples) >= n:
+            break
     return samples[:n]
 
 
 def load_all(n_per_dataset: int = 20) -> list[EvalSample]:
     loaders = [load_ag_news, load_wikiann_ner, load_stsb, load_sst2,
-               load_gsm8k, load_arc_challenge]
+               load_gsm8k, load_squad, load_hotpotqa]
     samples: list[EvalSample] = []
     for fn in loaders:
         try:
