@@ -4,7 +4,6 @@ Tiered local/cloud AI inference. A local 4B model generates token-by-token while
 
 **52% cheaper than the Anthropic Advisor pattern. 8.6pp more accurate overall. On document QA, the advisor regresses 30pp; the buddy system holds.**
 
-> Read the full write-up: [The Buddy System — Medium](ARTICLE_URL)
 
 ## How it works
 
